@@ -1,0 +1,111 @@
+# 0x2764
+
+Portable dotfiles managed as [GNU Stow](https://www.gnu.org/software/stow/) packages, plus a safe importer for an existing home directory.
+
+Each top-level package mirrors its destination relative to `$HOME`:
+
+```text
+0x2764/
+├── hypr/.config/hypr/...
+├── git/.gitconfig
+├── ssh/.ssh/config
+└── 0x2764-cli/.local/bin/0x2764
+```
+
+The package names in [`.0x2764-packages`](.0x2764-packages) are installed by default. Keeping an explicit manifest prevents documentation or future support directories from accidentally being treated as packages.
+
+## Requirements
+
+- Bash 4 or newer
+- GNU Stow
+- `fzf` only for the interactive config picker
+- GNU `find`, `readlink`, and `realpath`
+
+On Arch Linux:
+
+```sh
+sudo pacman -S stow fzf
+```
+
+## Bootstrap a clone
+
+Clone the repository at any location, then run:
+
+```sh
+./bootstrap --dry-run  # inspect
+./bootstrap            # stow every registered package into $HOME
+```
+
+The included `0x2764-cli` package installs `0x2764` into `~/.local/bin`, so the repository bootstraps its own command. Ensure that directory is on `PATH`, or continue invoking `./0x2764` from the clone.
+
+Bootstrap is idempotent. GNU Stow will report a conflict rather than overwrite a real file.
+
+## Import existing XDG configs
+
+Run the interactive picker:
+
+```sh
+./0x2764 import
+```
+
+Or name directories explicitly:
+
+```sh
+./0x2764 import --dry-run hypr nvim waybar
+./0x2764 import hypr nvim waybar
+```
+
+Use `--all` only after carefully inspecting the dry run:
+
+```sh
+./0x2764 import --all --dry-run
+./0x2764 import --all --yes
+```
+
+Selected directories are moved from `${XDG_CONFIG_HOME:-$HOME/.config}` into separate packages and immediately stowed back into place. For example:
+
+```text
+~/.config/hypr/             ->  0x2764/hypr/.config/hypr/
+~/.config/hypr (symlink)    <-  created by Stow
+```
+
+The importer:
+
+- never imports unselected directories;
+- rejects symlinks, existing packages, and paths outside `$HOME`;
+- simulates Stow after moving but before creating links;
+- rolls the move back if simulation or Stow fails;
+- asks before changing anything unless `--yes` is supplied;
+- registers each successful package in `.0x2764-packages`.
+
+Imports are intentionally performed one package at a time. If a later package in a batch conflicts, earlier successful packages remain imported and the failing package is rolled back.
+
+> **Audit before importing.** Config trees can contain credentials, tokens, browser profiles, generated state, and machine-specific data. The tool cannot decide what is safe to commit.
+
+If `XDG_CONFIG_HOME` is customized, it must still be below `$HOME`, because this repository uses `$HOME` as Stow's common target. `--config-dir DIR` can override it for one import.
+
+## Import other home files
+
+`add` creates one new package while preserving every source path relative to `$HOME`:
+
+```sh
+./0x2764 add --dry-run git ~/.gitconfig
+./0x2764 add git ~/.gitconfig
+
+./0x2764 add zsh ~/.zshrc ~/.zprofile
+./0x2764 add ssh ~/.ssh/config
+```
+
+A package must be new. This restriction makes rollback predictable and avoids modifying an already-stowed package during a failed import.
+
+## Day-to-day commands
+
+```sh
+0x2764 list
+0x2764 stow --dry-run          # all registered packages
+0x2764 stow hypr nvim          # selected packages
+0x2764 unstow hypr
+0x2764 help
+```
+
+To add a package manually, create its Stow tree at the repository root and add its name to `.0x2764-packages`. Do not run Stow over the repository root itself; always pass explicit package names (the command does this for you).
