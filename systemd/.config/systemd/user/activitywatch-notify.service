@@ -1,0 +1,51 @@
+[Unit]
+Description=ActivityWatch desktop notification service
+Documentation=https://github.com/ActivityWatch/aw-notify-rs
+Requires=activitywatch-server.service
+After=activitywatch-server.service graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/activitywatch/aw-notify start
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+# aw-notify may query the ActivityWatch server over loopback and use the
+# session D-Bus over AF_UNIX, but it may not contact external addresses.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindDeny=any
+
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/activitywatch/aw-notify
+ReadWritePaths=%h/.cache/activitywatch/aw-notify
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=yes
+KeyringMode=private
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=graphical-session.target

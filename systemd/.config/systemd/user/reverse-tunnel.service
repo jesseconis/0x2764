@@ -1,0 +1,18 @@
+[Unit]
+Description=Persistent reverse SSH tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment="AUTOSSH_GATETIME=0"
+Environment="AUTOSSH_PIDFILE=%t/autossh-reverse-tunnel.pid"
+
+ExecStart=/usr/bin/autossh -M 0 -N reverse-vps
+
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
+

@@ -1,0 +1,50 @@
+[Unit]
+Description=ActivityWatch Wayland window and AFK watcher
+Documentation=https://github.com/ActivityWatch/aw-watcher-window-wayland
+Requires=activitywatch-server.service
+After=activitywatch-server.service graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/lib/activitywatch/aw-watcher-window-wayland
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+# Permit heartbeats to the local server, but no external network traffic and no
+# explicitly bound IP listener. Wayland itself uses an AF_UNIX socket.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindDeny=any
+
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/activitywatch/client_locks
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=yes
+KeyringMode=private
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=graphical-session.target

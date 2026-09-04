@@ -1,0 +1,54 @@
+[Unit]
+Description=ActivityWatch local Rust server
+Documentation=https://docs.activitywatch.net/
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=%h/.local/lib/activitywatch/aw-server-rust --host 127.0.0.1 --port 5600 --no-legacy-import
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+
+# The server may communicate only over loopback and may bind only TCP/5600.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SocketBindAllow=ipv4:tcp:5600
+SocketBindDeny=any
+
+# Filesystem access: database/configuration/logs only.
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/activitywatch/aw-server-rust
+ReadWritePaths=%h/.local/share/activitywatch/aw-server-rust
+ReadWritePaths=%h/.cache/activitywatch/aw-server-rust
+ReadWritePaths=%h/.cache/activitywatch/log/aw-server-rust
+
+# Process/kernel hardening.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+PrivateUsers=yes
+KeyringMode=private
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=default.target
