@@ -1,5 +1,28 @@
 # 0x2764
 
+## Check and repair links
+
+Inspect every registered package (or only the packages named on the command line):
+
+```bash
+./0x2764 check
+./0x2764 doctor systemd
+```
+
+A check reports missing links, stale/broken links (for example, after moving the
+repository), and unmanaged targets that Stow cannot replace safely. Checks do
+not modify files and exit non-zero when an issue is found.
+
+Repair missing and broken links with:
+
+```bash
+./0x2764 doctor --repair systemd
+# Skip the confirmation prompt:
+./0x2764 check --fix --yes
+```
+
+Repair refuses to overwrite conflicting regular files or links.
+
 ## Import
 
 ### Interactive (fzf)
