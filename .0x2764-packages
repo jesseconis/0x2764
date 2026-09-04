@@ -1,0 +1,7 @@
+# One GNU Stow package per line. This is also the default bootstrap order.
+0x2764-cli
+lazygit
+kitty
+warpd-rs
+btop
+systemd

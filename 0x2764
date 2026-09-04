@@ -1,0 +1,655 @@
+#!/usr/bin/env bash
+# Manage GNU Stow packages in this repository and safely import existing files.
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+PROGRAM=${0##*/}
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+REPO=$(dirname -- "$SCRIPT_PATH")
+MANIFEST="$REPO/.0x2764-packages"
+STOW_BIN=${STOW_BIN:-stow}
+HOME_DIR=$(realpath -m -- "$HOME")
+
+DRY_RUN=false
+ASSUME_YES=false
+PLAN_CONFIRMED=false
+TX_ACTIVE=false
+TX_PACKAGE=
+TX_MANIFEST_APPENDED=false
+DOCTOR_TX_ACTIVE=false
+declare -a TX_SOURCES=()
+declare -a TX_DESTINATIONS=()
+declare -a DOCTOR_TX_PATHS=()
+declare -a DOCTOR_TX_LINKS=()
+declare -a CHECK_TYPES=()
+declare -a CHECK_PACKAGES=()
+declare -a CHECK_RELATIVES=()
+declare -a CHECK_TARGETS=()
+
+usage() {
+    cat <<EOF
+Usage:
+  $PROGRAM import [OPTIONS] [CONFIG ...]
+  $PROGRAM add [OPTIONS] PACKAGE PATH [PATH ...]
+  $PROGRAM stow [--dry-run] [PACKAGE ...]
+  $PROGRAM unstow [--dry-run] [PACKAGE ...]
+  $PROGRAM check [--repair] [--yes] [PACKAGE ...]
+  $PROGRAM doctor [--repair] [--yes] [PACKAGE ...]
+  $PROGRAM list
+
+Commands:
+  import    Move selected XDG config directories into packages and stow them.
+            With no CONFIG arguments, opens an fzf multi-select picker.
+  add       Move one or more paths below HOME into a new named package.
+  stow      Stow named packages, or every package in the manifest.
+  unstow    Unstow named packages, or every package in the manifest.
+  check     Find missing, broken, or conflicting package targets.
+  doctor    Alias for check. Pass --repair (or --fix) to recreate links.
+  list      List registered packages.
+
+Import options:
+  -a, --all              Import every directory in XDG_CONFIG_HOME.
+  -c, --config-dir DIR   Use DIR instead of XDG_CONFIG_HOME.
+  -n, --dry-run          Print the plan without changing anything.
+  -y, --yes              Do not ask for confirmation.
+
+Add options:
+  -n, --dry-run          Print the plan without changing anything.
+  -y, --yes              Do not ask for confirmation.
+
+Check/doctor options:
+  -r, --repair, --fix    Remove stale broken links and restow missing ones.
+  -y, --yes              Do not ask for confirmation before repairing.
+
+Examples:
+  $PROGRAM import
+  $PROGRAM import --dry-run hypr nvim waybar
+  $PROGRAM import --all --yes
+  $PROGRAM add --dry-run git ~/.gitconfig
+  $PROGRAM add ssh ~/.ssh/config
+  $PROGRAM stow
+  $PROGRAM check
+  $PROGRAM doctor --repair --yes systemd
+EOF
+}
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+validate_package_name() {
+    local name=$1
+    [[ $name =~ ^[[:alnum:]][[:alnum:].+_-]*$ ]] ||
+        die "invalid package name '$name' (use letters, numbers, '.', '+', '_', or '-')"
+}
+
+manifest_has() {
+    local package=$1
+    [[ -f $MANIFEST ]] && grep -Fqx -- "$package" "$MANIFEST"
+}
+
+manifest_packages() {
+    [[ -f $MANIFEST ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line%%#*}
+        # Package names cannot contain whitespace, so removing all of it is safe.
+        line=${line//[[:space:]]/}
+        [[ -n $line ]] && printf '%s\n' "$line"
+    done < "$MANIFEST"
+}
+
+remove_from_manifest() {
+    local package=$1 tmp
+    [[ -f $MANIFEST ]] || return 0
+    tmp=$(mktemp "$REPO/.0x2764-packages.XXXXXX") || return 1
+    grep -Fvx -- "$package" "$MANIFEST" > "$tmp" || true
+    mv -- "$tmp" "$MANIFEST"
+}
+
+path_below_home() {
+    local input=$1 absolute
+    absolute=$(realpath -m -- "$input")
+    case $absolute in
+        "$HOME_DIR"/*) printf '%s\n' "${absolute#"$HOME_DIR"/}" ;;
+        *) die "path must be below HOME ($HOME_DIR): $input" ;;
+    esac
+}
+
+print_command() {
+    printf '  '
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+confirm_plan() {
+    $ASSUME_YES && return 0
+    [[ -t 0 ]] || die "confirmation requires a terminal; inspect with --dry-run, then use --yes"
+    local answer
+    printf 'Continue? [y/N] '
+    read -r answer
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || {
+        info 'Cancelled.'
+        exit 0
+    }
+}
+
+rollback_doctor() {
+    $DOCTOR_TX_ACTIVE || return 0
+    set +e
+    warn 'restoring stale links after failed repair'
+    local i path
+    for ((i=0; i<${#DOCTOR_TX_PATHS[@]}; i++)); do
+        path=${DOCTOR_TX_PATHS[$i]}
+        if [[ ! -e $path && ! -L $path ]]; then
+            mkdir -p -- "$(dirname -- "$path")"
+            ln -s -- "${DOCTOR_TX_LINKS[$i]}" "$path" ||
+                warn "could not restore stale link: $path"
+        fi
+    done
+    DOCTOR_TX_ACTIVE=false
+}
+
+rollback_transaction() {
+    $TX_ACTIVE || return 0
+    set +e
+    warn "rolling back import of package '$TX_PACKAGE'"
+
+    # A failed real Stow operation can leave some links behind. This package was
+    # required to be new, so deleting its links cannot affect an older package.
+    if command -v "$STOW_BIN" >/dev/null 2>&1 && [[ -d $REPO/$TX_PACKAGE ]]; then
+        "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" --delete "$TX_PACKAGE" \
+            >/dev/null 2>&1 || true
+    fi
+
+    local i source destination restore_failed=false
+    for ((i=${#TX_SOURCES[@]}-1; i>=0; i--)); do
+        source=${TX_SOURCES[$i]}
+        destination=${TX_DESTINATIONS[$i]}
+        if [[ -e $destination || -L $destination ]]; then
+            mkdir -p -- "$(dirname -- "$source")"
+            if ! mv -- "$destination" "$source"; then
+                warn "could not restore $source; data remains at $destination"
+                restore_failed=true
+            fi
+        fi
+    done
+
+    $TX_MANIFEST_APPENDED && remove_from_manifest "$TX_PACKAGE"
+    if ! $restore_failed && [[ -n $TX_PACKAGE && -d $REPO/$TX_PACKAGE ]]; then
+        rm -rf -- "$REPO/$TX_PACKAGE"
+    fi
+    TX_ACTIVE=false
+}
+
+on_exit() {
+    local status=$1
+    if (( status != 0 )); then
+        rollback_doctor
+        rollback_transaction
+    fi
+}
+trap 'on_exit $?' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+validate_new_package() {
+    local package=$1
+    validate_package_name "$package"
+    [[ ! -e $REPO/$package && ! -L $REPO/$package ]] ||
+        die "package already exists: $package"
+    ! manifest_has "$package" || die "package is already registered: $package"
+}
+
+validate_sources() {
+    local source relative destination other
+    declare -a relatives=()
+    for source in "$@"; do
+        [[ -e $source || -L $source ]] || die "source does not exist: $source"
+        [[ ! -L $source ]] || die "source is already a symbolic link: $source"
+        relative=$(path_below_home "$source")
+        destination=$REPO/$TX_PACKAGE/$relative
+        [[ ! -e $destination && ! -L $destination ]] ||
+            die "package destination already exists: $destination"
+
+        for other in "${relatives[@]}"; do
+            [[ $relative != "$other"/* && $other != "$relative"/* ]] ||
+                die "overlapping source paths cannot be imported together: $relative and $other"
+        done
+        relatives+=("$relative")
+    done
+}
+
+import_new_package() {
+    local package=$1
+    shift
+    local -a sources=("$@") destinations=()
+    local source relative destination i preflight_output preflight_status
+
+    TX_PACKAGE=$package
+    validate_new_package "$package"
+    validate_sources "${sources[@]}"
+
+    info "Package: $package"
+    for source in "${sources[@]}"; do
+        source=$(realpath -m -- "$source")
+        relative=$(path_below_home "$source")
+        destination=$REPO/$package/$relative
+        destinations+=("$destination")
+        printf '  move %s\n       -> %s\n' "$source" "$destination"
+    done
+    print_command "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" "$package"
+
+    $DRY_RUN && return 0
+    $PLAN_CONFIRMED || confirm_plan
+
+    TX_SOURCES=("${sources[@]}")
+    # Store canonical source paths, matching the paths used by mv below.
+    for ((i=0; i<${#TX_SOURCES[@]}; i++)); do
+        TX_SOURCES[$i]=$(realpath -m -- "${TX_SOURCES[$i]}")
+    done
+    TX_DESTINATIONS=("${destinations[@]}")
+    TX_MANIFEST_APPENDED=false
+    TX_ACTIVE=true
+
+    for ((i=0; i<${#TX_SOURCES[@]}; i++)); do
+        mkdir -p -- "$(dirname -- "${TX_DESTINATIONS[$i]}")"
+        mv -- "${TX_SOURCES[$i]}" "${TX_DESTINATIONS[$i]}"
+    done
+
+    # Perform an internal dry run to catch target conflicts before Stow can
+    # create links. Capture its expected "simulation mode" warning so it cannot
+    # be mistaken for the result of the real Stow operation that follows.
+    info '  Checking the Stow target for conflicts...'
+    if preflight_output=$(
+        "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" \
+            --simulate --verbose=1 "$package" 2>&1
+    ); then
+        info '  Preflight passed; creating links...'
+    else
+        preflight_status=$?
+        warn "Stow preflight failed for '$package':"
+        [[ -n $preflight_output ]] && printf '%s\n' "$preflight_output" >&2
+        return "$preflight_status"
+    fi
+
+    "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" "$package"
+    info '  Links created.'
+    printf '%s\n' "$package" >> "$MANIFEST"
+    TX_MANIFEST_APPENDED=true
+    TX_ACTIVE=false
+    info "Imported and stowed '$package'."
+}
+
+select_configs() {
+    local config_dir=$1 output status
+    require_command fzf
+    [[ -t 0 ]] || die "interactive selection requires a terminal; pass names or use --all"
+
+    set +e
+    output=$(
+        find "$config_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' |
+            LC_ALL=C sort |
+            fzf --multi --prompt='Add to 0x2764 > ' --header='TAB select, ENTER confirm'
+    )
+    status=$?
+    set -e
+    (( status == 0 )) || {
+        (( status == 1 || status == 130 )) && exit 0
+        die "fzf selection failed"
+    }
+    [[ -n $output ]] || exit 0
+    printf '%s\n' "$output"
+}
+
+cmd_import() {
+    local config_dir=${XDG_CONFIG_HOME:-$HOME_DIR/.config}
+    local import_all=false
+    local -a names=() sources=()
+    DRY_RUN=false
+    ASSUME_YES=false
+
+    while (($#)); do
+        case $1 in
+            -a|--all) import_all=true ;;
+            -c|--config-dir)
+                (($# >= 2)) || die "$1 requires a directory"
+                config_dir=$2
+                shift
+                ;;
+            -n|--dry-run) DRY_RUN=true ;;
+            -y|--yes) ASSUME_YES=true ;;
+            -h|--help) usage; return ;;
+            --) shift; names+=("$@"); break ;;
+            -*) die "unknown import option: $1" ;;
+            *) names+=("$1") ;;
+        esac
+        shift
+    done
+
+    config_dir=$(realpath -m -- "$config_dir")
+    [[ -d $config_dir ]] || die "config directory does not exist: $config_dir"
+    path_below_home "$config_dir" >/dev/null
+    ! $import_all || ((${#names[@]} == 0)) || die "--all cannot be combined with config names"
+
+    if $import_all; then
+        mapfile -t names < <(find "$config_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort)
+    elif ((${#names[@]} == 0)); then
+        local selection
+        selection=$(select_configs "$config_dir") || return $?
+        [[ -n $selection ]] && mapfile -t names <<< "$selection"
+    fi
+    ((${#names[@]})) || { info 'No config directories selected.'; return; }
+
+    local name source i noun=directories
+    declare -A seen=()
+    for name in "${names[@]}"; do
+        validate_package_name "$name"
+        [[ $name != */* && $name != . && $name != .. ]] || die "invalid config name: $name"
+        [[ ! -v seen[$name] ]] || die "config selected more than once: $name"
+        seen[$name]=1
+        source=$config_dir/$name
+        [[ -d $source && ! -L $source ]] || die "config is not a directory (or is a symlink): $source"
+        validate_new_package "$name"
+        sources+=("$source")
+    done
+
+    ((${#names[@]} == 1)) && noun=directory
+    info "Will import ${#names[@]} config $noun:"
+    for ((i=0; i<${#names[@]}; i++)); do
+        printf '  %s -> package %s\n' "${sources[$i]}" "${names[$i]}"
+    done
+    if ! $DRY_RUN; then
+        confirm_plan
+        PLAN_CONFIRMED=true
+    fi
+
+    for ((i=0; i<${#names[@]}; i++)); do
+        import_new_package "${names[$i]}" "${sources[$i]}"
+    done
+}
+
+cmd_add() {
+    DRY_RUN=false
+    ASSUME_YES=false
+    while (($#)); do
+        case $1 in
+            -n|--dry-run) DRY_RUN=true; shift ;;
+            -y|--yes) ASSUME_YES=true; shift ;;
+            -h|--help) usage; return ;;
+            --) shift; break ;;
+            -*) die "unknown add option: $1" ;;
+            *) break ;;
+        esac
+    done
+    (($# >= 2)) || die "add requires PACKAGE and at least one PATH"
+    local package=$1
+    shift
+
+    TX_PACKAGE=$package
+    validate_new_package "$package"
+    validate_sources "$@"
+    import_new_package "$package" "$@"
+}
+
+resolve_packages() {
+    local -a requested=("$@")
+    if ((${#requested[@]} == 0)); then
+        mapfile -t requested < <(manifest_packages)
+    fi
+    ((${#requested[@]})) || die "no packages are registered in $MANIFEST"
+
+    local package
+    for package in "${requested[@]}"; do
+        validate_package_name "$package"
+        [[ -d $REPO/$package ]] || die "package directory does not exist: $REPO/$package"
+        printf '%s\n' "$package"
+    done
+}
+
+cmd_stow_action() {
+    local action=$1
+    shift
+    local dry=false
+    local -a requested=() packages=() args=()
+    while (($#)); do
+        case $1 in
+            -n|--dry-run) dry=true ;;
+            -h|--help) usage; return ;;
+            --) shift; requested+=("$@"); break ;;
+            -*) die "unknown $action option: $1" ;;
+            *) requested+=("$1") ;;
+        esac
+        shift
+    done
+    local resolved
+    resolved=$(resolve_packages "${requested[@]}") || return $?
+    mapfile -t packages <<< "$resolved"
+    require_command "$STOW_BIN"
+    args=(--dir="$REPO" --target="$HOME_DIR")
+    [[ $action == unstow ]] && args+=(--delete)
+    $dry && args+=(--simulate --verbose=2)
+    print_command "$STOW_BIN" "${args[@]}" "${packages[@]}"
+    "$STOW_BIN" "${args[@]}" "${packages[@]}"
+}
+
+record_check_issue() {
+    CHECK_TYPES+=("$1")
+    CHECK_PACKAGES+=("$2")
+    CHECK_RELATIVES+=("$3")
+    CHECK_TARGETS+=("$4")
+}
+
+inspect_package_path() {
+    local package=$1 relative=$2
+    local source=$REPO/$package/$relative target=$HOME_DIR/$relative
+    local source_real target_real child child_relative
+
+    if [[ ! -e $target ]]; then
+        if [[ -L $target ]]; then
+            record_check_issue broken "$package" "$relative" "$target"
+        else
+            record_check_issue missing "$package" "$relative" "$target"
+        fi
+        return 0
+    fi
+
+    source_real=$(realpath -m -- "$source")
+    target_real=$(realpath -m -- "$target")
+    # A link on this path or one of its ancestors may expose the package file
+    # directly. In that case the path is healthy and its children are too.
+    [[ $source_real != "$target_real" ]] || return 0
+
+    if [[ -d $source && ! -L $source && -d $target && ! -L $target ]]; then
+        while IFS= read -r -d '' child; do
+            child_relative=${child#"$REPO/$package/"}
+            inspect_package_path "$package" "$child_relative"
+        done < <(find "$source" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+        return 0
+    fi
+
+    record_check_issue conflict "$package" "$relative" "$target"
+}
+
+inspect_packages() {
+    CHECK_TYPES=()
+    CHECK_PACKAGES=()
+    CHECK_RELATIVES=()
+    CHECK_TARGETS=()
+    local package source relative
+    for package in "$@"; do
+        while IFS= read -r -d '' source; do
+            relative=${source#"$REPO/$package/"}
+            inspect_package_path "$package" "$relative"
+        done < <(find "$REPO/$package" -mindepth 1 -maxdepth 1 -print0 | sort -z)
+    done
+}
+
+print_check_report() {
+    local i type broken=0 missing=0 conflicts=0 detail
+    for ((i=0; i<${#CHECK_TYPES[@]}; i++)); do
+        type=${CHECK_TYPES[$i]}
+        detail=
+        case $type in
+            broken)
+                ((broken+=1))
+                detail=" -> $(readlink -- "${CHECK_TARGETS[$i]}")"
+                ;;
+            missing) ((missing+=1)) ;;
+            conflict)
+                ((conflicts+=1))
+                detail=' (an unmanaged target already exists)'
+                ;;
+        esac
+        printf '%-8s %s [%s]%s\n' "${type^^}" "${CHECK_RELATIVES[$i]}" \
+            "${CHECK_PACKAGES[$i]}" "$detail"
+    done
+
+    if ((${#CHECK_TYPES[@]} == 0)); then
+        info 'All package links are healthy.'
+    else
+        printf 'Found %d issue(s): %d broken, %d missing, %d conflict(s).\n' \
+            "${#CHECK_TYPES[@]}" "$broken" "$missing" "$conflicts"
+    fi
+}
+
+repair_package_links() {
+    local -a packages=("$@") repair_packages=()
+    local i package output status
+    local conflicts=false
+    declare -A seen=()
+
+    DOCTOR_TX_PATHS=()
+    DOCTOR_TX_LINKS=()
+    for ((i=0; i<${#CHECK_TYPES[@]}; i++)); do
+        case ${CHECK_TYPES[$i]} in
+            conflict) conflicts=true ;;
+            broken)
+                DOCTOR_TX_PATHS+=("${CHECK_TARGETS[$i]}")
+                DOCTOR_TX_LINKS+=("$(readlink -- "${CHECK_TARGETS[$i]}")")
+                package=${CHECK_PACKAGES[$i]}
+                if [[ ! -v seen[$package] ]]; then
+                    seen[$package]=1
+                    repair_packages+=("$package")
+                fi
+                ;;
+            missing)
+                package=${CHECK_PACKAGES[$i]}
+                if [[ ! -v seen[$package] ]]; then
+                    seen[$package]=1
+                    repair_packages+=("$package")
+                fi
+                ;;
+        esac
+    done
+
+    if $conflicts; then
+        warn 'conflicts cannot be repaired safely; no changes made'
+        return 1
+    fi
+    ((${#repair_packages[@]})) || return 0
+
+    info 'Repair plan:'
+    for ((i=0; i<${#DOCTOR_TX_PATHS[@]}; i++)); do
+        printf '  remove stale link %s\n' "${DOCTOR_TX_PATHS[$i]}"
+    done
+    print_command "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" "${repair_packages[@]}"
+    confirm_plan
+
+    DOCTOR_TX_ACTIVE=true
+    for i in "${DOCTOR_TX_PATHS[@]}"; do
+        rm -- "$i"
+    done
+
+    info '  Checking the Stow target for conflicts...'
+    if output=$("$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" \
+        --simulate --verbose=1 "${repair_packages[@]}" 2>&1); then
+        info '  Preflight passed; recreating links...'
+    else
+        status=$?
+        [[ -n $output ]] && printf '%s\n' "$output" >&2
+        rollback_doctor
+        return "$status"
+    fi
+
+    if "$STOW_BIN" --dir="$REPO" --target="$HOME_DIR" "${repair_packages[@]}"; then
+        :
+    else
+        status=$?
+        rollback_doctor
+        return "$status"
+    fi
+    DOCTOR_TX_ACTIVE=false
+
+    inspect_packages "${packages[@]}"
+    if ((${#CHECK_TYPES[@]})); then
+        warn 'repair finished, but some package targets are still unhealthy'
+        print_check_report
+        return 1
+    fi
+    info 'Repair complete. All package links are healthy.'
+}
+
+cmd_check() {
+    local repair=false
+    local -a requested=() packages=()
+    ASSUME_YES=false
+    while (($#)); do
+        case $1 in
+            -r|--repair|--fix) repair=true ;;
+            -y|--yes) ASSUME_YES=true ;;
+            -h|--help) usage; return ;;
+            --) shift; requested+=("$@"); break ;;
+            -*) die "unknown check option: $1" ;;
+            *) requested+=("$1") ;;
+        esac
+        shift
+    done
+    $repair || ! $ASSUME_YES || die '--yes requires --repair'
+
+    local resolved
+    resolved=$(resolve_packages "${requested[@]}") || return $?
+    mapfile -t packages <<< "$resolved"
+    inspect_packages "${packages[@]}"
+    print_check_report
+
+    ((${#CHECK_TYPES[@]})) || return 0
+    if ! $repair; then
+        return 1
+    fi
+    require_command "$STOW_BIN"
+    repair_package_links "${packages[@]}"
+}
+
+cmd_list() {
+    local package found=false
+    while IFS= read -r package; do
+        found=true
+        if [[ -d $REPO/$package ]]; then
+            printf '%s\n' "$package"
+        else
+            printf '%s (missing)\n' "$package"
+        fi
+    done < <(manifest_packages)
+    $found || info 'No packages registered.'
+}
+
+main() {
+    local command=${1:-help}
+    (($#)) && shift
+    case $command in
+        import) require_command "$STOW_BIN"; cmd_import "$@" ;;
+        add) require_command "$STOW_BIN"; cmd_add "$@" ;;
+        stow) cmd_stow_action stow "$@" ;;
+        unstow|delete) cmd_stow_action unstow "$@" ;;
+        check|doctor) cmd_check "$@" ;;
+        list) cmd_list "$@" ;;
+        help|-h|--help) usage ;;
+        *) die "unknown command: $command (try '$PROGRAM help')" ;;
+    esac
+}
+
+main "$@"
